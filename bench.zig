@@ -143,11 +143,11 @@ fn benchArgFn(comptime argType: type) type {
 
 fn argTypeFromFn(comptime f: anytype) type {
     const F = @TypeOf(f);
-    if (@typeInfo(F) != .Fn) {
+    if (@typeInfo(F) != .@"fn") {
         @compileError("Argument must be a function.");
     }
 
-    const fnInfo = @typeInfo(F).Fn;
+    const fnInfo = @typeInfo(F).@"fn";
     if (fnInfo.params.len != 2) {
         @compileError("Only functions taking 1 argument are accepted.");
     }
@@ -155,78 +155,88 @@ fn argTypeFromFn(comptime f: anytype) type {
     return fnInfo.params[1].type.?;
 }
 
-pub fn benchmarkArgs(comptime name: []const u8, comptime f: anytype, comptime args: []const argTypeFromFn(f)) void {
-    inline for (args) |arg| {
-        var ctx = Context.init();
-        @call(.never_inline, f, .{ &ctx, arg });
+fn benchmarkArg(comptime name: []const u8, comptime f: anytype, arg: argTypeFromFn(f)) void {
+    var ctx = Context.init();
+    @call(.never_inline, f, .{ &ctx, arg });
 
-        var unit: u64 = undefined;
-        var unit_name: []const u8 = undefined;
-        const avg_time = ctx.averageTime(1);
-        assert(avg_time >= 0);
+    var unit: u64 = undefined;
+    var unit_name: []const u8 = undefined;
+    const avg_time = ctx.averageTime(1);
+    assert(avg_time >= 0);
 
-        if (avg_time <= time.ns_per_us) {
-            unit = 1;
-            unit_name = "ns";
-        } else if (avg_time <= time.ns_per_ms) {
-            unit = time.ns_per_us;
-            unit_name = "us";
-        } else {
-            unit = time.ns_per_ms;
-            unit_name = "ms";
-        }
+    if (avg_time <= time.ns_per_us) {
+        unit = 1;
+        unit_name = "ns";
+    } else if (avg_time <= time.ns_per_ms) {
+        unit = time.ns_per_us;
+        unit_name = "us";
+    } else {
+        unit = time.ns_per_ms;
+        unit_name = "ms";
+    }
 
-        const typeOfArg = @TypeOf(arg);
-        if (typeOfArg == type) {
-            print("{s} <{s}>: avg {d:.3}{s} ({d} iterations)\n", .{
-                name,
-                @typeName(arg),
-                ctx.averageTime(unit),
-                unit_name,
-                ctx.iter,
-            });
-        } else {
-            print("{s} <{any}>: avg {d:.3}{s} ({d} iterations)\n", .{
-                name,
-                arg,
-                ctx.averageTime(unit),
-                unit_name,
-                ctx.iter,
-            });
-        }
+    const typeOfArg = @TypeOf(arg);
+    // TODO: improve text report, this is workaround to avoid printing entire slices to bench log
+    if (typeOfArg == type or @typeInfo(typeOfArg) == .pointer) {
+        print("{s} <{s}>: avg {d:.3}{s} ({d} iterations)\n", .{
+            name,
+            @typeName(typeOfArg),
+            ctx.averageTime(unit),
+            unit_name,
+            ctx.iter,
+        });
+    } else {
+        print("{s} <{any}>: avg {d:.3}{s} ({d} iterations)\n", .{
+            name,
+            arg,
+            ctx.averageTime(unit),
+            unit_name,
+            ctx.iter,
+        });
     }
 }
 
+pub fn benchmarkArgs(comptime name: []const u8, comptime f: anytype, args: []const argTypeFromFn(f)) void {
+    // This check is needed so that args can also accept runtime-known values.
+    if (argTypeFromFn(f) == type) {
+        inline for (args) |arg| {
+            benchmarkArg(name, f, arg);
+        }
+        return;
+    }
+    for (args) |arg| {
+        benchmarkArg(name, f, arg);
+    }
+}
 pub fn doNotOptimize(value: anytype) void {
     // LLVM triggers an assert if we pass non-trivial types as inputs for the
     // asm volatile expression.
     // Workaround until asm support is better on Zig's end.
     const T = @TypeOf(value);
-    switch (T) {
-        .Bool, .Int, .Float => {
+    switch (@typeInfo(T)) {
+        .bool, .int, .float => {
             asm volatile (""
                 :
                 : [_] "r,m" (value),
                 : "memory"
             );
         },
-        .Optional => {
+        .optional => {
             if (value) |v| doNotOptimize(v);
         },
-        .Struct => {
+        .@"struct" => {
             inline for (comptime std.meta.fields(T)) |field| {
                 doNotOptimize(@field(value, field.name));
             }
         },
-        .Type,
-        .Void,
-        .NoReturn,
-        .ComptimeFloat,
-        .ComptimeInt,
-        .Undefined,
-        .Null,
-        .Fn,
-        .BoundFn,
+        .type,
+        .void,
+        .noreturn,
+        .comptime_float,
+        .comptime_int,
+        .undefined,
+        .null,
+        .@"fn",
         => @compileError("doNotOptimize makes no sense for " ++ @tagName(T)),
         else => @compileError("doNotOptimize is not implemented for " ++ @tagName(T)),
     }
@@ -265,6 +275,27 @@ test "benchmarkArgs" {
 
     benchmarkArgs("Sleep", benchSleep, &[_]u32{ 20, 30, 57 });
 }
+test "benchmarkArgs runtime args" {
+    if (!ENABLE_TESTS) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var timestamps = try allocator.alloc(i64, 100);
+    defer allocator.free(timestamps);
+    @memset(timestamps, std.time.milliTimestamp());
+
+    const benchRuntimeArgs = struct {
+        fn benchRuntimeArgs(ctx: *Context, stamps: []i64) void {
+            while (ctx.run()) {
+                var sum: i64 = 0;
+                for (stamps) |val| {
+                    sum += val;
+                }
+                doNotOptimize(sum);
+            }
+        }
+    }.benchRuntimeArgs;
+
+    benchmarkArgs("runtime args", benchRuntimeArgs, &[_][]i64{ timestamps[0..20], timestamps[20..100] });
+}
 
 test "benchmarkArgs types" {
     if (!ENABLE_TESTS) return error.SkipZigTest;
@@ -278,7 +309,6 @@ test "benchmarkArgs types" {
             }
         }
     }.benchMin;
-
     benchmarkArgs("Min", benchMin, &[_]type{ u32, u64 });
 }
 
